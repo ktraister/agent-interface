@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -24,9 +23,7 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"image/color"
 
-	"github.com/BurntSushi/toml"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/bedrock"
 	anthropicopt "github.com/anthropics/anthropic-sdk-go/option"
@@ -35,28 +32,6 @@ import (
 	openai "github.com/openai/openai-go/v3"
 	openaiopt "github.com/openai/openai-go/v3/option"
 )
-
-type Config struct {
-	Backend         string `toml:"backend"` // "brave" or "claude"
-	BraveAPIKey     string `toml:"brave_api_key"`
-	ClaudeBaseURL   string `toml:"claude_base_url"`
-	ClaudeModel     string `toml:"claude_model"`
-	ClaudeAPIKey    string `toml:"claude_api_key"`
-	ClaudeUseBedrock bool  `toml:"claude_use_bedrock"`
-	SystemPrompt    string `toml:"system_prompt"`
-	BuckyLib      string `toml:"bucky_lib"`
-	WhisperModel  string `toml:"whisper_model"`
-	PiperModel    string `toml:"piper_model"`
-}
-
-type keyBinding struct {
-	key fyne.KeyName
-	mod fyne.KeyModifier
-}
-
-type whiteDisabledTheme struct {
-	fyne.Theme
-}
 
 var (
 	appCfg          Config
@@ -167,9 +142,14 @@ func main() {
 	textInput.PlaceHolder = "Or type here..."
 
 	// Conversation history
-	history := widget.NewEntry()
-	history.MultiLine = true
-	history.Wrapping = fyne.TextWrapWord
+	history := widget.NewRichText(
+		&widget.TextSegment{
+			Text: "",
+			Style: widget.RichTextStyle{
+				Alignment: fyne.TextAlignLeading,
+			},
+		},
+	)
 	historyScroll := container.NewScroll(history)
 
 	// Status label
@@ -192,7 +172,11 @@ func main() {
 
 	// Clear Button
 	clearBtn := widget.NewButton("Clear", func() {
-		history.SetText("")
+		history.Segments = append(history.Segments, &widget.TextSegment{
+			Text:  "",
+			Style: widget.RichTextStyle{},
+		})
+		history.Refresh()
 		braveConvo.Reset()
 		msgMu.Lock()
 		claudeMessages = nil
@@ -361,7 +345,7 @@ func main() {
 }
 
 // --- Handle a query (dispatches to configured backend) ---
-func handleQuery(query string, history *widget.Entry, status *widget.Label, voiceCheck *widget.Check) {
+func handleQuery(query string, history *widget.RichText, status *widget.Label, voiceCheck *widget.Check) {
 	if query == "[ Silence ]" {
 		return
 	}
@@ -371,14 +355,14 @@ func handleQuery(query string, history *widget.Entry, status *widget.Label, voic
 		status.SetText("Thinking...")
 	})
 
-	var fullAnswer string
+	var dirtyAnswer string
 	var err error
 
 	switch appCfg.Backend {
 	case "claude":
-		fullAnswer, err = queryBedrock(query)
+		dirtyAnswer, err = queryBedrock(query)
 	default:
-		fullAnswer, err = queryBrave(query)
+		dirtyAnswer, err = queryBrave(query)
 	}
 
 	if err != nil {
@@ -387,8 +371,11 @@ func handleQuery(query string, history *widget.Entry, status *widget.Label, voic
 		return
 	}
 
+	fullAnswer := cleanForSpeech(dirtyAnswer)
+
 	fyne.DoAndWait(func() {
-		appendMessage(history, "AI: "+cleanForSpeech(fullAnswer))
+		appendMessage(history, "AI: "+fullAnswer)
+		appendMessage(history, "")
 	})
 
 	if voiceCheck.Checked {
@@ -555,127 +542,4 @@ func recordAudio() []byte {
 		return nil
 	}
 	return data
-}
-
-// --- Whisper transcription ---
-func transcribe(rawData []byte) string {
-	mu.Lock()
-	defer mu.Unlock()
-
-	numSamples := len(rawData) / 2
-	samples := make([]float32, numSamples)
-	for i := 0; i < numSamples; i++ {
-		s := int16(rawData[i*2]) | int16(rawData[i*2+1])<<8
-		samples[i] = float32(s) / 32768.0
-	}
-
-	wparams := whisper.FullDefaultParams(whisper.SamplingGreedy)
-	wparams.NoTimestamps = 1
-	if err := whisper.Full(wctx, wparams, samples); err != nil {
-		fmt.Fprintf(os.Stderr, "whisper.Full: %v\n", err)
-		return ""
-	}
-
-	var sb strings.Builder
-	for i := int32(0); i < whisper.FullNSegments(wctx); i++ {
-		sb.WriteString(whisper.FullGetSegmentText(wctx, i))
-	}
-	return strings.TrimSpace(sb.String())
-}
-
-// --- TTS ---
-func speak(text string) {
-	text = cleanForSpeech(text)
-	cmd := exec.Command("piper", "--model", piperModel, "--output-raw")
-	cmd.Stdin = strings.NewReader(text)
-	var wavBuf bytes.Buffer
-	cmd.Stdout = &wavBuf
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "piper: %v\n", err)
-		return
-	}
-
-	aplayMu.Lock()
-	aplayProc = playCmd()
-	aplayProc.Stdin = &wavBuf
-	if err := aplayProc.Start(); err != nil {
-		aplayMu.Unlock()
-		fmt.Fprintf(os.Stderr, "playback: %v\n", err)
-		return
-	}
-	atomic.StoreInt32(&aplayRunning, 1)
-	aplayMu.Unlock()
-
-	aplayProc.Wait()
-	atomic.StoreInt32(&aplayRunning, 0)
-}
-
-// --- Helpers ---
-func appendMessage(history *widget.Entry, text string) {
-	current := history.Text
-	history.SetText(current + text + "\n")
-	history.CursorRow = len(strings.Split(history.Text, "\n")) - 1
-}
-
-func cleanForSpeech(text string) string {
-	if i := strings.Index(text, "<usage>"); i >= 0 {
-		text = text[:i]
-	}
-	for {
-		start := strings.Index(text, "```")
-		if start < 0 {
-			break
-		}
-		end := strings.Index(text[start+3:], "```")
-		if end < 0 {
-			text = text[:start]
-			break
-		}
-		text = text[:start] + text[start+3+end+3:]
-	}
-	text = strings.ReplaceAll(text, "`", "")
-	text = strings.ReplaceAll(text, "**", "")
-	text = strings.ReplaceAll(text, "*", "")
-	for strings.Contains(text, "\n\n") {
-		text = strings.ReplaceAll(text, "\n\n", "\n")
-	}
-	return strings.TrimSpace(text)
-}
-
-func (t whiteDisabledTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) color.Color {
-	if name == theme.ColorNameDisabled {
-		return color.White
-	}
-	return t.Theme.Color(name, variant)
-}
-
-func beep(freq int) {
-	exec.Command("play", "-n", "-q", "-r", "22050", "-c", "1",
-		"synth", "0.1", "sine", fmt.Sprintf("%d", freq)).Run()
-}
-
-type proxyTransport struct {
-	inner      http.RoundTripper
-	scheme     string
-	host       string
-	pathPrefix string
-}
-
-func (t *proxyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	r.URL.Scheme = t.scheme
-	r.URL.Host = t.host
-	r.URL.Path = t.pathPrefix + r.URL.Path
-	r.Host = t.host
-	return t.inner.RoundTrip(r)
-}
-
-func loadConfig() Config {
-	var cfg Config
-	path := os.ExpandEnv("$HOME/.agent-interface.toml")
-	_, err := toml.DecodeFile(path, &cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "config: %v (expected at %s)\n", err, path)
-		os.Exit(1)
-	}
-	return cfg
 }
